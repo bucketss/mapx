@@ -1,0 +1,27 @@
+ever download a bunch of maps, then go to unzip them and they're all in different directory structures?
+
+so instead of just unzipping and playing them, you have to untangle the mess while also deleting a bunch of useless readmes and screenshots >:(
+
+I hate that shit lmao, so here's a program for it.
+
+just drag and drop archives (7z rar zip) and it'll extract the files, put them in the proper cstrike\ subfolders, then deletes or sequesters the junk (like readmes and screenshots and configs)
+
+[CODE]flags:
+-l, --log       write timestamped log file
+-j, --junk      delete junk files (default: save to junk folder)
+-a, --addons    ignore addons\ directory (default: save to __addons\)
+-e, --executable extract to exe dir (default: archive dir)
+-d, --delete    delete archives after successful extraction
+-h, --help      show help message[/CODE]
+
+by default it moves junk files to a junk folder, and also preserves any addons\ folder content in __addons\ to prevent overwrites (but still allow a map to come with an accompanying plugin or w/e)
+
+this doesn't just extract, it will also put loose files in the correct locations
+
+the only thing it could miss is directories of sounds (or models) that are stored in the root of an archive instead of inside the sounds\ dir
+
+so if it's supposed to be "sounds\map1\sound1.wav", but it's archived as "map1\sound1.wav", then sound1.wav will just get moved to sounds\ without its dir
+
+if this happens, the person who archived the map made a serious mistake and I cannot protect you from them lol
+
+written in C, source included (requires libarchive)

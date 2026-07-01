@@ -1,0 +1,5 @@
+# build artifacts / backups
+*.o
+*.old
+*_update.zip
+*.lnk
