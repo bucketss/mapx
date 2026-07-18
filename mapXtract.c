@@ -46,7 +46,6 @@ int pending_txt_count = 0;
 char temp_files_created[1000][MAX_PATH_LEN];
 int temp_file_count = 0;
 
-// Track successfully processed archives for deletion
 char processed_archives[1000][MAX_PATH_LEN];
 int processed_archive_count = 0;
 
@@ -416,7 +415,6 @@ int txt_has_matching_bsp(const char* txt_filename) {
         if (strcmp(txt_name, bsp_lower) == 0) {
             return 1;
         }
-        // <mapname>_detail.txt lists the map's detail textures - required
         size_t bsp_len = strlen(bsp_lower);
         if (strncmp(txt_name, bsp_lower, bsp_len) == 0 &&
             strcmp(txt_name + bsp_len, "_detail") == 0) {
@@ -477,7 +475,6 @@ void get_target_directory(const char* filename, const char* original_path, char*
         strcpy(target_dir, "models");
     }
     else if (strcmp(ext_lower, "bmp") == 0) {
-        // Check if BMP file is in gfx\ or its subdirectories
         if (strstr(path_lower, "gfx/") != NULL || strstr(path_lower, "gfx\\") != NULL) {
             strcpy(target_dir, "gfx/env");
         } else {
@@ -504,11 +501,6 @@ void get_target_directory(const char* filename, const char* original_path, char*
     }
 }
 
-// Case-insensitive match of `root` as a whole path component anywhere in
-// `path` (which is already sanitized to forward slashes). Returns a pointer
-// into `path` at the start of that component, or NULL. Archives often wrap
-// content in a top-level folder (cstrike/, MapName/), so the content root
-// must be found anywhere in the path, not just as a prefix.
 const char* find_path_component(const char* path, const char* root) {
     size_t root_len = strlen(root);
     for (const char* p = path; *p; p++) {
@@ -547,7 +539,6 @@ const char* detect_archive_type(const char* filename) {
 void process_pending_txt_files(const char* baseDir, int* junked, int delete_junk) {
     log_printf("processing txt files...\n");
     
-    // Lazy BSP matching - if no BSPs found, junk all TXT files immediately
     if (bsp_count == 0) {
         log_printf("no BSP files found, junking all TXT files...\n");
         for (int i = 0; i < pending_txt_count; i++) {
@@ -849,15 +840,13 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
             }
         }
         else {
-            // Preserve subfolders (models/MAN/, gfx/detail/, sound/xyz/...)
-            // by anchoring on the content root wherever it sits in the path.
             const char* sub = NULL;
             if (strcmp(target_dir, "junk") != 0) {
                 char root[32];
                 strncpy(root, target_dir, sizeof(root) - 1);
                 root[sizeof(root) - 1] = '\0';
                 char* slash = strchr(root, '/');
-                if (slash) *slash = '\0';  // "gfx/env" -> anchor on "gfx"
+                if (slash) *slash = '\0';  
                 sub = find_path_component(safe_pathname, root);
             }
             int result;
