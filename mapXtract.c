@@ -51,6 +51,7 @@ int processed_archive_count = 0;
 const char* get_filename(const char* path);
 void cleanup_temp_files(void);
 void log_printf(const char* format, ...);
+int is_directory(const char* path);
 
 void add_processed_archive(const char* archive_path) {
     if (processed_archive_count >= 1000) {
@@ -897,7 +898,11 @@ void walk_extracted_dir(const char* abs_dir, const char* rel_prefix, const char*
 
     WIN32_FIND_DATA findFileData;
     HANDLE hFind = FindFirstFile(searchPath, &findFileData);
-    if (hFind == INVALID_HANDLE_VALUE) return;
+    if (hFind == INVALID_HANDLE_VALUE) {
+        log_printf("WARNING: cannot enumerate directory, contents skipped: %s\n", abs_dir);
+        (*skipped)++;
+        return;
+    }
 
     do {
         if (strcmp(findFileData.cFileName, ".") == 0 || strcmp(findFileData.cFileName, "..") == 0) {
@@ -955,7 +960,11 @@ void walk_extracted_dir(const char* abs_dir, const char* rel_prefix, const char*
                         int skip_addons, int delete_junk,
                         int* count, int* extracted, int* junked, int* skipped) {
     DIR* dir = opendir(abs_dir);
-    if (!dir) return;
+    if (!dir) {
+        log_printf("WARNING: cannot enumerate directory, contents skipped: %s\n", abs_dir);
+        (*skipped)++;
+        return;
+    }
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != NULL) {
@@ -1025,8 +1034,9 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
     const char* archive_type = detect_archive_type(archive_path);
     log_printf("\n>>> processing %s (%s)\n", archive_path, archive_type);
 
+    static int staging_seq = 0;
     char staging[MAX_PATH_LEN];
-    if (snprintf(staging, sizeof(staging), "%s%c__mapx7z_%d", baseDir, PATH_SEP, getpid()) >= sizeof(staging)) {
+    if (snprintf(staging, sizeof(staging), "%s%c__mapx7z_%d_%d", baseDir, PATH_SEP, getpid(), ++staging_seq) >= sizeof(staging)) {
         log_printf("ERROR: Staging path too long for %s\n", archive_path);
         return -1;
     }
@@ -1057,6 +1067,9 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
 
     walk_extracted_dir(staging, "", baseDir, skip_addons, delete_junk, &count, &extracted, &junked, &skipped);
     remove_tree(staging);
+    if (is_directory(staging)) {
+        log_printf("WARNING: could not fully remove staging dir: %s\n", staging);
+    }
 
     process_pending_txt_files(baseDir, &junked, delete_junk);
 
