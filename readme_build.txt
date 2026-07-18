@@ -1,4 +1,4 @@
-requires libarchive (-lzip not needed, only libarchive is linked)
+requires libarchive
 
 build w icon (windows):
 
