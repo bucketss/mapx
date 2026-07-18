@@ -205,16 +205,15 @@ int generate_unique_temp_filename(const char* baseDir, const char* original_file
 void log_printf(const char* format, ...) {
     va_list args;
     va_start(args, format);
-    
     vprintf(format, args);
-    
+    va_end(args);
+
     if (log_file) {
         va_start(args, format);
         vfprintf(log_file, format, args);
+        va_end(args);
         fflush(log_file);
     }
-    
-    va_end(args);
 }
 
 int validate_path_length(const char* path, const char* operation) {
@@ -403,12 +402,24 @@ int txt_has_matching_bsp(const char* txt_filename) {
     char txt_name[256];
     strncpy(txt_name, get_filename(txt_filename), sizeof(txt_name) - 1);
     txt_name[sizeof(txt_name) - 1] = '\0';
-    
+
     char* dot = strrchr(txt_name, '.');
     if (dot) *dot = '\0';
-    
+    to_lowercase(txt_name);
+
     for (int i = 0; i < bsp_count; i++) {
-        if (strcmp(txt_name, bsp_files[i]) == 0) {
+        char bsp_lower[256];
+        strncpy(bsp_lower, bsp_files[i], sizeof(bsp_lower) - 1);
+        bsp_lower[sizeof(bsp_lower) - 1] = '\0';
+        to_lowercase(bsp_lower);
+
+        if (strcmp(txt_name, bsp_lower) == 0) {
+            return 1;
+        }
+        // <mapname>_detail.txt lists the map's detail textures - required
+        size_t bsp_len = strlen(bsp_lower);
+        if (strncmp(txt_name, bsp_lower, bsp_len) == 0 &&
+            strcmp(txt_name + bsp_len, "_detail") == 0) {
             return 1;
         }
     }
@@ -493,43 +504,43 @@ void get_target_directory(const char* filename, const char* original_path, char*
     }
 }
 
-int path_has_correct_structure(const char* path, const char* target_dir) {
-    if (target_dir[0] == '\0') return 1;
-    
-    char path_lower[MAX_PATH_LEN];
-    strncpy(path_lower, path, sizeof(path_lower) - 1);
-    path_lower[sizeof(path_lower) - 1] = '\0';
-    to_lowercase(path_lower);
-    
-    char target_lower[256];
-    strncpy(target_lower, target_dir, sizeof(target_lower) - 1);
-    target_lower[sizeof(target_lower) - 1] = '\0';
-    to_lowercase(target_lower);
-    
-    return strncmp(path_lower, target_lower, strlen(target_lower)) == 0 &&
-           (path_lower[strlen(target_lower)] == '/' || path_lower[strlen(target_lower)] == '\\' || path_lower[strlen(target_lower)] == '\0');
+// Case-insensitive match of `root` as a whole path component anywhere in
+// `path` (which is already sanitized to forward slashes). Returns a pointer
+// into `path` at the start of that component, or NULL. Archives often wrap
+// content in a top-level folder (cstrike/, MapName/), so the content root
+// must be found anywhere in the path, not just as a prefix.
+const char* find_path_component(const char* path, const char* root) {
+    size_t root_len = strlen(root);
+    for (const char* p = path; *p; p++) {
+        if (p != path && p[-1] != '/') continue;
+        size_t i = 0;
+        while (i < root_len && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)root[i])) i++;
+        if (i == root_len && p[root_len] == '/') return p;
+    }
+    return NULL;
 }
 
 int is_supported_archive(const char* filename) {
-    char filename_lower[256];
-    strncpy(filename_lower, filename, sizeof(filename_lower) - 1);
-    filename_lower[sizeof(filename_lower) - 1] = '\0';
-    to_lowercase(filename_lower);
-    
-    return (strstr(filename_lower, ".zip") != NULL ||
-            strstr(filename_lower, ".rar") != NULL ||
-            strstr(filename_lower, ".7z") != NULL);
+    char ext_lower[16];
+    strncpy(ext_lower, get_extension(filename), sizeof(ext_lower) - 1);
+    ext_lower[sizeof(ext_lower) - 1] = '\0';
+    to_lowercase(ext_lower);
+
+    return (strcmp(ext_lower, "zip") == 0 ||
+            strcmp(ext_lower, "rar") == 0 ||
+            strcmp(ext_lower, "7z") == 0);
 }
 
 const char* detect_archive_type(const char* filename) {
-    char filename_lower[256];
-    strncpy(filename_lower, filename, sizeof(filename_lower) - 1);
-    filename_lower[sizeof(filename_lower) - 1] = '\0';
-    to_lowercase(filename_lower);
-    
-    if (strstr(filename_lower, ".zip") != NULL) return "ZIP";
-    if (strstr(filename_lower, ".rar") != NULL) return "RAR";
-    if (strstr(filename_lower, ".7z") != NULL) return "7Z";
+    char ext_lower[16];
+    strncpy(ext_lower, get_extension(filename), sizeof(ext_lower) - 1);
+    ext_lower[sizeof(ext_lower) - 1] = '\0';
+    to_lowercase(ext_lower);
+
+    if (strcmp(ext_lower, "zip") == 0) return "ZIP";
+    if (strcmp(ext_lower, "rar") == 0) return "RAR";
+    if (strcmp(ext_lower, "7z") == 0) return "7Z";
     return "UNKNOWN";
 }
 
@@ -749,8 +760,9 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
     while ((r = archive_read_next_header(a, &entry)) == ARCHIVE_OK) {
         const char* pathname = archive_entry_pathname(entry);
         la_int64_t size = archive_entry_size(entry);
-        
-        if (archive_entry_filetype(entry) == AE_IFDIR) {
+
+        if (!pathname || archive_entry_filetype(entry) == AE_IFDIR) {
+            archive_read_data_skip(a);
             count++;
             continue;
         }
@@ -836,19 +848,24 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
                 continue;
             }
         }
-        else if (path_has_correct_structure(safe_pathname, target_dir)) {
-            int result = snprintf(finalPath, sizeof(finalPath), "%s/%s", baseDir, safe_pathname);
-            if (result >= sizeof(finalPath)) {
-                log_printf("ERROR: Structured path too long, skipping: %s\n", safe_pathname);
-                archive_read_data_skip(a);
-                skipped++;
-                count++;
-                continue;
-            }
-        }
         else {
-            const char* filename = get_filename(safe_pathname);
-            int result = snprintf(finalPath, sizeof(finalPath), "%s/%s/%s", baseDir, target_dir, filename);
+            // Preserve subfolders (models/MAN/, gfx/detail/, sound/xyz/...)
+            // by anchoring on the content root wherever it sits in the path.
+            const char* sub = NULL;
+            if (strcmp(target_dir, "junk") != 0) {
+                char root[32];
+                strncpy(root, target_dir, sizeof(root) - 1);
+                root[sizeof(root) - 1] = '\0';
+                char* slash = strchr(root, '/');
+                if (slash) *slash = '\0';  // "gfx/env" -> anchor on "gfx"
+                sub = find_path_component(safe_pathname, root);
+            }
+            int result;
+            if (sub) {
+                result = snprintf(finalPath, sizeof(finalPath), "%s/%s", baseDir, sub);
+            } else {
+                result = snprintf(finalPath, sizeof(finalPath), "%s/%s/%s", baseDir, target_dir, get_filename(safe_pathname));
+            }
             if (result >= sizeof(finalPath)) {
                 log_printf("ERROR: Target path too long, skipping: %s\n", safe_pathname);
                 archive_read_data_skip(a);
@@ -886,13 +903,17 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
         int data_error = 0;
         
         while ((r = archive_read_data_block(a, &buff, &buff_size, &offset)) == ARCHIVE_OK) {
-            fwrite(buff, 1, buff_size, output);
+            if (fwrite(buff, 1, buff_size, output) != buff_size) {
+                data_error = 1;
+                log_printf("WARNING: Write failed for %s: %s\n", finalPath, strerror(errno));
+                break;
+            }
             total_read += buff_size;
         }
         
-        if (r != ARCHIVE_EOF) {
+        if (r != ARCHIVE_EOF && !data_error) {
             data_error = 1;
-            log_printf("WARNING: Data corruption detected in %s (error: %s)\n", 
+            log_printf("WARNING: Data corruption detected in %s (error: %s)\n",
                       pathname, archive_error_string(a));
         }
         
