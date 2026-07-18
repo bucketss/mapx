@@ -8,8 +8,6 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <ctype.h>
-#include <archive.h>
-#include <archive_entry.h>
 #include <time.h>
 #include <stdarg.h>
 #include <signal.h>
@@ -25,6 +23,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #define MKDIR(path) mkdir(path, 0755)
 #define PATH_SEP '/'
 #endif
@@ -48,9 +47,6 @@ int temp_file_count = 0;
 
 char processed_archives[1000][MAX_PATH_LEN];
 int processed_archive_count = 0;
-
-struct archive *global_archive = NULL;
-FILE* global_output_file = NULL;
 
 const char* get_filename(const char* path);
 void cleanup_temp_files(void);
@@ -82,17 +78,7 @@ void delete_processed_archives(void) {
 
 void emergency_cleanup(void) {
     cleanup_temp_files();
-    
-    if (global_output_file) {
-        fclose(global_output_file);
-        global_output_file = NULL;
-    }
-    
-    if (global_archive) {
-        archive_read_free(global_archive);
-        global_archive = NULL;
-    }
-    
+
     if (log_file) {
         fprintf(log_file, "\n>>> Emergency cleanup performed\n");
         fclose(log_file);
@@ -702,10 +688,333 @@ void process_pending_txt_files(const char* baseDir, int* junked, int delete_junk
     }
 }
 
+int run_7z_extract(const char* archive_path, const char* out_dir) {
+#ifdef _WIN32
+    char qodir[MAX_PATH_LEN + 8];
+    char qarc[MAX_PATH_LEN + 4];
+    snprintf(qodir, sizeof(qodir), "\"-o%s\"", out_dir);
+    snprintf(qarc, sizeof(qarc), "\"%s\"", archive_path);
+
+    const char* argv7z[] = { "7z", "x", "-y", "-aoa", "-bso0", "-bsp0", qodir, qarc, NULL };
+    intptr_t rc = _spawnvp(_P_WAIT, "7z", argv7z);
+    if (rc == -1) {
+        const char* exe = "C:\\Program Files\\7-Zip\\7z.exe";
+        char qexe[MAX_PATH_LEN];
+        snprintf(qexe, sizeof(qexe), "\"%s\"", exe);
+        argv7z[0] = qexe;
+        rc = _spawnv(_P_WAIT, exe, argv7z);
+    }
+    return (int)rc;
+#else
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        char odir[MAX_PATH_LEN + 4];
+        snprintf(odir, sizeof(odir), "-o%s", out_dir);
+        execlp("7z", "7z", "x", "-y", "-aoa", "-bso0", "-bsp0", odir, archive_path, (char*)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (!WIFEXITED(status)) return -1;
+    int code = WEXITSTATUS(status);
+    return (code == 127) ? -1 : code;
+#endif
+}
+
+int move_file(const char* src, const char* dst) {
+    remove(dst);
+    if (rename(src, dst) == 0) return 1;
+
+    FILE* in = fopen(src, "rb");
+    if (!in) return 0;
+    FILE* out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return 0;
+    }
+
+    char buffer[65536];
+    size_t bytes;
+    int ok = 1;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), in)) > 0) {
+        if (fwrite(buffer, 1, bytes, out) != bytes) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ferror(in)) ok = 0;
+    fclose(in);
+    fclose(out);
+    if (ok) remove(src);
+    else remove(dst);
+    return ok;
+}
+
+void process_staged_file(const char* src_path, const char* rel_path, const char* baseDir,
+                         int skip_addons, int delete_junk,
+                         int* count, int* extracted, int* junked, int* skipped) {
+    (*count)++;
+
+    if (!validate_path_length(rel_path, "archive entry path")) {
+        (*skipped)++;
+        return;
+    }
+
+    if (!is_safe_path(rel_path)) {
+        log_printf("SECURITY: Dangerous path blocked: %s\n", rel_path);
+        (*skipped)++;
+        return;
+    }
+
+    char safe_pathname[MAX_PATH_LEN];
+    sanitize_path(rel_path, safe_pathname, sizeof(safe_pathname));
+
+    log_printf("%s\n", safe_pathname);
+
+    char target_dir[256];
+    get_target_directory(get_filename(safe_pathname), safe_pathname, target_dir, sizeof(target_dir), skip_addons);
+
+    if (strcmp(target_dir, "SKIP") == 0) {
+        log_printf("skipped (addons): %s\n", safe_pathname);
+        (*skipped)++;
+        return;
+    }
+
+    char finalPath[MAX_PATH_LEN];
+
+    if (strcmp(target_dir, "TXT_CHECK") == 0) {
+        if (!generate_unique_temp_filename(baseDir, safe_pathname, finalPath, sizeof(finalPath))) {
+            log_printf("ERROR: Could not generate unique temp filename for: %s\n", safe_pathname);
+            (*skipped)++;
+            return;
+        }
+    }
+    else if (strcmp(target_dir, "BASEDIR") == 0) {
+        const char* filename = get_filename(safe_pathname);
+        int result = snprintf(finalPath, sizeof(finalPath), "%s/%s", baseDir, filename);
+        if (result >= sizeof(finalPath)) {
+            log_printf("ERROR: Base path too long, skipping: %s\n", safe_pathname);
+            (*skipped)++;
+            return;
+        }
+    }
+    else if (strcmp(target_dir, "JUNK_PRESERVE") == 0) {
+        int result = snprintf(finalPath, sizeof(finalPath), "%s/junk/%s", baseDir, safe_pathname);
+        if (result >= sizeof(finalPath)) {
+            log_printf("ERROR: Junk preserve path too long, skipping: %s\n", safe_pathname);
+            (*skipped)++;
+            return;
+        }
+    }
+    else if (strcmp(target_dir, "ADDONS_PRESERVE") == 0) {
+        const char* addons_pos = strstr(safe_pathname, "addons/");
+        if (!addons_pos) addons_pos = strstr(safe_pathname, "addons\\");
+        int result;
+        if (addons_pos) {
+            const char* after_addons = addons_pos + 7;
+            result = snprintf(finalPath, sizeof(finalPath), "%s/__addons/%s", baseDir, after_addons);
+        } else {
+            result = snprintf(finalPath, sizeof(finalPath), "%s/__addons/%s", baseDir, safe_pathname);
+        }
+        if (result >= sizeof(finalPath)) {
+            log_printf("ERROR: Addons path too long, skipping: %s\n", safe_pathname);
+            (*skipped)++;
+            return;
+        }
+    }
+    else {
+        const char* sub = NULL;
+        if (strcmp(target_dir, "junk") != 0) {
+            char root[32];
+            strncpy(root, target_dir, sizeof(root) - 1);
+            root[sizeof(root) - 1] = '\0';
+            char* slash = strchr(root, '/');
+            if (slash) *slash = '\0';
+            sub = find_path_component(safe_pathname, root);
+        }
+        int result;
+        if (sub) {
+            result = snprintf(finalPath, sizeof(finalPath), "%s/%s", baseDir, sub);
+        } else {
+            result = snprintf(finalPath, sizeof(finalPath), "%s/%s/%s", baseDir, target_dir, get_filename(safe_pathname));
+        }
+        if (result >= sizeof(finalPath)) {
+            log_printf("ERROR: Target path too long, skipping: %s\n", safe_pathname);
+            (*skipped)++;
+            return;
+        }
+    }
+
+    if (!validate_path_length(finalPath, "final extraction path")) {
+        (*skipped)++;
+        return;
+    }
+
+    int will_be_junked = (strcmp(target_dir, "junk") == 0);
+
+    create_dirs_recursive(finalPath);
+
+    if (!move_file(src_path, finalPath)) {
+        log_printf("failed to create file: %s - %s\n", finalPath, strerror(errno));
+        return;
+    }
+
+    if (strcmp(target_dir, "TXT_CHECK") == 0) {
+        add_temp_file_for_cleanup(finalPath);
+        add_pending_txt(finalPath, safe_pathname);
+    } else {
+        log_printf("%s\n", finalPath);
+        if (will_be_junked) {
+            if (delete_junk) {
+                remove(finalPath);
+                log_printf("deleted (junk): %s\n", get_filename(safe_pathname));
+            }
+            (*junked)++;
+        }
+    }
+
+    const char* ext = get_extension(get_filename(safe_pathname));
+    char ext_lower[16];
+    strncpy(ext_lower, ext, sizeof(ext_lower) - 1);
+    ext_lower[sizeof(ext_lower) - 1] = '\0';
+    to_lowercase(ext_lower);
+
+    if (strcmp(ext_lower, "bsp") == 0) {
+        add_bsp_file(safe_pathname);
+        log_printf("%s\n", get_filename(safe_pathname));
+    }
+
+    (*extracted)++;
+}
+
+#ifdef _WIN32
+void walk_extracted_dir(const char* abs_dir, const char* rel_prefix, const char* baseDir,
+                        int skip_addons, int delete_junk,
+                        int* count, int* extracted, int* junked, int* skipped) {
+    char searchPath[MAX_PATH_LEN];
+    if (snprintf(searchPath, sizeof(searchPath), "%s\\*", abs_dir) >= sizeof(searchPath)) return;
+
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind = FindFirstFile(searchPath, &findFileData);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (strcmp(findFileData.cFileName, ".") == 0 || strcmp(findFileData.cFileName, "..") == 0) {
+            continue;
+        }
+
+        char absPath[MAX_PATH_LEN];
+        char relPath[MAX_PATH_LEN];
+        if (snprintf(absPath, sizeof(absPath), "%s\\%s", abs_dir, findFileData.cFileName) >= sizeof(absPath) ||
+            snprintf(relPath, sizeof(relPath), "%s%s%s", rel_prefix, rel_prefix[0] ? "/" : "", findFileData.cFileName) >= sizeof(relPath)) {
+            log_printf("ERROR: Path too long for archive entry: %s\n", findFileData.cFileName);
+            (*skipped)++;
+            (*count)++;
+            continue;
+        }
+
+        if (findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            walk_extracted_dir(absPath, relPath, baseDir, skip_addons, delete_junk, count, extracted, junked, skipped);
+        } else {
+            process_staged_file(absPath, relPath, baseDir, skip_addons, delete_junk, count, extracted, junked, skipped);
+        }
+    } while (FindNextFile(hFind, &findFileData) != 0);
+
+    FindClose(hFind);
+}
+
+void remove_tree(const char* abs_dir) {
+    char searchPath[MAX_PATH_LEN];
+    if (snprintf(searchPath, sizeof(searchPath), "%s\\*", abs_dir) >= sizeof(searchPath)) return;
+
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind = FindFirstFile(searchPath, &findFileData);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (strcmp(findFileData.cFileName, ".") == 0 || strcmp(findFileData.cFileName, "..") == 0) {
+                continue;
+            }
+            char absPath[MAX_PATH_LEN];
+            if (snprintf(absPath, sizeof(absPath), "%s\\%s", abs_dir, findFileData.cFileName) >= sizeof(absPath)) {
+                continue;
+            }
+            if (findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                remove_tree(absPath);
+            } else {
+                SetFileAttributes(absPath, FILE_ATTRIBUTE_NORMAL);
+                remove(absPath);
+            }
+        } while (FindNextFile(hFind, &findFileData) != 0);
+        FindClose(hFind);
+    }
+    RemoveDirectory(abs_dir);
+}
+#else
+void walk_extracted_dir(const char* abs_dir, const char* rel_prefix, const char* baseDir,
+                        int skip_addons, int delete_junk,
+                        int* count, int* extracted, int* junked, int* skipped) {
+    DIR* dir = opendir(abs_dir);
+    if (!dir) return;
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char absPath[MAX_PATH_LEN];
+        char relPath[MAX_PATH_LEN];
+        if (snprintf(absPath, sizeof(absPath), "%s/%s", abs_dir, entry->d_name) >= sizeof(absPath) ||
+            snprintf(relPath, sizeof(relPath), "%s%s%s", rel_prefix, rel_prefix[0] ? "/" : "", entry->d_name) >= sizeof(relPath)) {
+            log_printf("ERROR: Path too long for archive entry: %s\n", entry->d_name);
+            (*skipped)++;
+            (*count)++;
+            continue;
+        }
+
+        struct stat st;
+        if (stat(absPath, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            walk_extracted_dir(absPath, relPath, baseDir, skip_addons, delete_junk, count, extracted, junked, skipped);
+        } else if (S_ISREG(st.st_mode)) {
+            process_staged_file(absPath, relPath, baseDir, skip_addons, delete_junk, count, extracted, junked, skipped);
+        }
+    }
+    closedir(dir);
+}
+
+void remove_tree(const char* abs_dir) {
+    DIR* dir = opendir(abs_dir);
+    if (dir) {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            char absPath[MAX_PATH_LEN];
+            if (snprintf(absPath, sizeof(absPath), "%s/%s", abs_dir, entry->d_name) >= sizeof(absPath)) {
+                continue;
+            }
+            struct stat st;
+            if (stat(absPath, &st) != 0) continue;
+            if (S_ISDIR(st.st_mode)) {
+                remove_tree(absPath);
+            } else {
+                remove(absPath);
+            }
+        }
+        closedir(dir);
+    }
+    rmdir(abs_dir);
+}
+#endif
+
 int extract_archive(const char* archive_path, const char* baseDir, int skip_addons, int delete_junk) {
-    if (!validate_path_length(archive_path, "archive path") || 
+    if (!validate_path_length(archive_path, "archive path") ||
         !validate_path_length(baseDir, "base directory")) return -1;
-    
+
     FILE* test = fopen(archive_path, "r");
     if (!test) {
         log_printf("cannot open archive file: %s\n", archive_path);
@@ -716,253 +1025,38 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
     const char* archive_type = detect_archive_type(archive_path);
     log_printf("\n>>> processing %s (%s)\n", archive_path, archive_type);
 
-    struct archive *a;
-    struct archive_entry *entry;
-    int r;
+    char staging[MAX_PATH_LEN];
+    if (snprintf(staging, sizeof(staging), "%s%c__mapx7z_%d", baseDir, PATH_SEP, getpid()) >= sizeof(staging)) {
+        log_printf("ERROR: Staging path too long for %s\n", archive_path);
+        return -1;
+    }
 
-    a = archive_read_new();
-    if (!a) {
-        log_printf("failed to create archive object\n");
-        return -1;
-    }
-    
-    global_archive = a;
-    
-    archive_read_support_filter_all(a);
-    archive_read_support_format_all(a);
-    
-    r = archive_read_open_filename(a, archive_path, 10240);
-    if (r != ARCHIVE_OK) {
-        log_printf("failed to open archive: %s\n", archive_error_string(a));
-        archive_read_free(a);
-        global_archive = NULL;
-        return -1;
-    }
+    remove_tree(staging);
+    create_dir(staging);
 
     bsp_count = 0;
     pending_txt_count = 0;
-    
+
     int count = 0;
     int extracted = 0;
     int junked = 0;
     int skipped = 0;
     log_printf("extracting files...\n");
 
-    while ((r = archive_read_next_header(a, &entry)) == ARCHIVE_OK) {
-        const char* pathname = archive_entry_pathname(entry);
-        la_int64_t size = archive_entry_size(entry);
-
-        if (!pathname || archive_entry_filetype(entry) == AE_IFDIR) {
-            archive_read_data_skip(a);
-            count++;
-            continue;
-        }
-
-        if (!validate_path_length(pathname, "archive entry path")) {
-            archive_read_data_skip(a);
-            skipped++;
-            count++;
-            continue;
-        }
-        
-        if (!is_safe_path(pathname)) {
-            log_printf("SECURITY: Dangerous path blocked: %s\n", pathname);
-            archive_read_data_skip(a);
-            skipped++;
-            count++;
-            continue;
-        }
-        
-        char safe_pathname[MAX_PATH_LEN];
-        sanitize_path(pathname, safe_pathname, sizeof(safe_pathname));
-
-        log_printf("%s\n", safe_pathname);
-
-        char target_dir[256];
-        get_target_directory(get_filename(safe_pathname), safe_pathname, target_dir, sizeof(target_dir), skip_addons);
-        
-        if (strcmp(target_dir, "SKIP") == 0) {
-            log_printf("skipped (addons): %s\n", safe_pathname);
-            archive_read_data_skip(a);
-            skipped++;
-            count++;
-            continue;
-        }
-        
-        char finalPath[MAX_PATH_LEN];
-        
-        if (strcmp(target_dir, "TXT_CHECK") == 0) {
-            if (!generate_unique_temp_filename(baseDir, safe_pathname, finalPath, sizeof(finalPath))) {
-                log_printf("ERROR: Could not generate unique temp filename for: %s\n", safe_pathname);
-                archive_read_data_skip(a);
-                skipped++;
-                count++;
-                continue;
-            }
-        }
-        else if (strcmp(target_dir, "BASEDIR") == 0) {
-            const char* filename = get_filename(safe_pathname);
-            int result = snprintf(finalPath, sizeof(finalPath), "%s/%s", baseDir, filename);
-            if (result >= sizeof(finalPath)) {
-                log_printf("ERROR: Base path too long, skipping: %s\n", safe_pathname);
-                archive_read_data_skip(a);
-                skipped++;
-                count++;
-                continue;
-            }
-        }
-        else if (strcmp(target_dir, "JUNK_PRESERVE") == 0) {
-            int result = snprintf(finalPath, sizeof(finalPath), "%s/junk/%s", baseDir, safe_pathname);
-            if (result >= sizeof(finalPath)) {
-                log_printf("ERROR: Junk preserve path too long, skipping: %s\n", safe_pathname);
-                archive_read_data_skip(a);
-                skipped++;
-                count++;
-                continue;
-            }
-        }
-        else if (strcmp(target_dir, "ADDONS_PRESERVE") == 0) {
-            const char* addons_pos = strstr(safe_pathname, "addons/");
-            if (!addons_pos) addons_pos = strstr(safe_pathname, "addons\\");
-            int result;
-            if (addons_pos) {
-                const char* after_addons = addons_pos + 7;
-                result = snprintf(finalPath, sizeof(finalPath), "%s/__addons/%s", baseDir, after_addons);
-            } else {
-                result = snprintf(finalPath, sizeof(finalPath), "%s/__addons/%s", baseDir, safe_pathname);
-            }
-            if (result >= sizeof(finalPath)) {
-                log_printf("ERROR: Addons path too long, skipping: %s\n", safe_pathname);
-                archive_read_data_skip(a);
-                skipped++;
-                count++;
-                continue;
-            }
-        }
-        else {
-            const char* sub = NULL;
-            if (strcmp(target_dir, "junk") != 0) {
-                char root[32];
-                strncpy(root, target_dir, sizeof(root) - 1);
-                root[sizeof(root) - 1] = '\0';
-                char* slash = strchr(root, '/');
-                if (slash) *slash = '\0';  
-                sub = find_path_component(safe_pathname, root);
-            }
-            int result;
-            if (sub) {
-                result = snprintf(finalPath, sizeof(finalPath), "%s/%s", baseDir, sub);
-            } else {
-                result = snprintf(finalPath, sizeof(finalPath), "%s/%s/%s", baseDir, target_dir, get_filename(safe_pathname));
-            }
-            if (result >= sizeof(finalPath)) {
-                log_printf("ERROR: Target path too long, skipping: %s\n", safe_pathname);
-                archive_read_data_skip(a);
-                skipped++;
-                count++;
-                continue;
-            }
-        }
-        
-        if (!validate_path_length(finalPath, "final extraction path")) {
-            archive_read_data_skip(a);
-            skipped++;
-            count++;
-            continue;
-        }
-        
-        int will_be_junked = (strcmp(target_dir, "junk") == 0);
-        
-        create_dirs_recursive(finalPath);
-        
-        FILE* output = fopen(finalPath, "wb");
-        if (output == NULL) {
-            log_printf("failed to create file: %s - %s\n", finalPath, strerror(errno));
-            archive_read_data_skip(a);
-            count++;
-            continue;
-        }
-        
-        global_output_file = output;
-
-        const void *buff;
-        size_t buff_size;
-        la_int64_t offset;
-        la_int64_t total_read = 0;
-        int data_error = 0;
-        
-        while ((r = archive_read_data_block(a, &buff, &buff_size, &offset)) == ARCHIVE_OK) {
-            if (fwrite(buff, 1, buff_size, output) != buff_size) {
-                data_error = 1;
-                log_printf("WARNING: Write failed for %s: %s\n", finalPath, strerror(errno));
-                break;
-            }
-            total_read += buff_size;
-        }
-        
-        if (r != ARCHIVE_EOF && !data_error) {
-            data_error = 1;
-            log_printf("WARNING: Data corruption detected in %s (error: %s)\n",
-                      pathname, archive_error_string(a));
-        }
-        
-        if (size >= 0 && total_read != size) {
-            data_error = 1;
-            log_printf("WARNING: Size mismatch in %s (expected: %lld, got: %lld)\n", 
-                      pathname, (long long)size, (long long)total_read);
-        }
-
-        fclose(output);
-        global_output_file = NULL;
-        
-        if (data_error) {
-            log_printf("CORRUPTED FILE REMOVED: %s\n", finalPath);
-            remove(finalPath);
-            count++;
-            continue;
-        }
-
-        if (strcmp(target_dir, "TXT_CHECK") == 0) {
-            add_temp_file_for_cleanup(finalPath);
-            add_pending_txt(finalPath, safe_pathname);
-        } else {
-            log_printf("%s\n", finalPath);
-            if (will_be_junked) {
-                if (delete_junk) {
-                    remove(finalPath);
-                    log_printf("deleted (junk): %s\n", get_filename(safe_pathname));
-                    junked++;
-                } else {
-                    junked++;
-                }
-            }
-        }
-
-        const char* ext = get_extension(get_filename(safe_pathname));
-        char ext_lower[16];
-        strncpy(ext_lower, ext, sizeof(ext_lower) - 1);
-        ext_lower[sizeof(ext_lower) - 1] = '\0';
-        to_lowercase(ext_lower);
-        
-        if (strcmp(ext_lower, "bsp") == 0) {
-            add_bsp_file(safe_pathname);
-            log_printf("%s\n", get_filename(safe_pathname));
-        }
-
-        extracted++;
-        count++;
+    int rc = run_7z_extract(archive_path, staging);
+    if (rc < 0) {
+        log_printf("ERROR: could not run 7z - install 7-Zip or add it to PATH\n");
+        remove_tree(staging);
+        return -1;
     }
-    
-    if (r != ARCHIVE_EOF && r != ARCHIVE_OK) {
-        log_printf("WARNING: Archive may be corrupted - stopped reading at entry %d (error: %s)\n", 
-                  count, archive_error_string(a));
+    if (rc == 1) {
+        log_printf("WARNING: 7z reported warnings for %s\n", archive_path);
+    } else if (rc > 1) {
+        log_printf("WARNING: 7z reported errors (exit code %d) for %s, processing extracted files anyway\n", rc, archive_path);
     }
 
-    r = archive_read_free(a);
-    global_archive = NULL;
-    if (r != ARCHIVE_OK) {
-        log_printf("warning: error closing archive: %s\n", archive_error_string(a));
-    }
+    walk_extracted_dir(staging, "", baseDir, skip_addons, delete_junk, &count, &extracted, &junked, &skipped);
+    remove_tree(staging);
 
     process_pending_txt_files(baseDir, &junked, delete_junk);
 
@@ -971,7 +1065,7 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
         log_printf(", %d files skipped", skipped);
     }
     log_printf(" from %s\n", archive_path);
-    total_junked += junked;  
+    total_junked += junked;
     return extracted;
 }
 

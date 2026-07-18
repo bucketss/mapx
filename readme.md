@@ -6,6 +6,8 @@ I hate that shit lmao, so here's a program for it.
 
 just drag and drop archives (7z rar zip) and it'll extract the files, put them in the proper `cstrike\` subfolders, then deletes or sequesters the junk (like readmes and screenshots and configs)
 
+needs [7-Zip](https://www.7-zip.org/) installed (`7z` on PATH or the default install location) — it does the actual decompression
+
 ```
 flags:
 -l, --log       write timestamped log file
