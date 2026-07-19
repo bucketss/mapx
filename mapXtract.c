@@ -363,8 +363,292 @@ void add_bsp_file(const char* filename) {
     
     char* dot = strrchr(bsp_files[bsp_count], '.');
     if (dot) *dot = '\0';
-    
+
     bsp_count++;
+}
+
+#define MAX_RESOURCES 4096
+
+struct resource_entry {
+    char path[MAX_PATH_LEN];
+    char source[64];
+    int found;
+};
+
+struct resource_entry resources[MAX_RESOURCES];
+int resource_count = 0;
+
+int str_ieq(const char* a, const char* b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+int str_ieq_n(const char* a, const char* b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 1;
+}
+
+void add_resource(const char* path, const char* source) {
+    char normalized[MAX_PATH_LEN];
+    sanitize_path(path, normalized, sizeof(normalized));
+    if (normalized[0] == '\0') return;
+    if (!is_safe_path(normalized) || strchr(normalized, ':')) return;
+
+    for (int i = 0; i < resource_count; i++) {
+        if (str_ieq(resources[i].path, normalized)) return;
+    }
+    if (resource_count >= MAX_RESOURCES) return;
+
+    strncpy(resources[resource_count].path, normalized, MAX_PATH_LEN - 1);
+    resources[resource_count].path[MAX_PATH_LEN - 1] = '\0';
+    strncpy(resources[resource_count].source, source, sizeof(resources[resource_count].source) - 1);
+    resources[resource_count].source[sizeof(resources[resource_count].source) - 1] = '\0';
+    resources[resource_count].found = 0;
+    resource_count++;
+}
+
+int find_resource_index(const char* filename) {
+    for (int i = 0; i < resource_count; i++) {
+        if (str_ieq(get_filename(resources[i].path), filename)) return i;
+    }
+    return -1;
+}
+
+int mark_resource_found(const char* filename) {
+    int first = -1;
+    for (int i = 0; i < resource_count; i++) {
+        if (str_ieq(get_filename(resources[i].path), filename)) {
+            resources[i].found = 1;
+            if (first < 0) first = i;
+        }
+    }
+    return first;
+}
+
+void scan_res_file(const char* abs_path, const char* source_name) {
+    FILE* f = fopen(abs_path, "r");
+    if (!f) return;
+
+    char line[512];
+    int before = resource_count;
+    while (fgets(line, sizeof(line), f)) {
+        char* s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        size_t len = strlen(s);
+        while (len > 0 && (s[len - 1] == '\n' || s[len - 1] == '\r' || s[len - 1] == ' ' || s[len - 1] == '\t')) {
+            s[--len] = '\0';
+        }
+        if (len == 0 || (s[0] == '/' && s[1] == '/')) continue;
+        if (s[0] == '"' && len >= 2 && s[len - 1] == '"') {
+            s[len - 1] = '\0';
+            s++;
+        }
+        add_resource(s, source_name);
+    }
+    fclose(f);
+    log_printf("res scan: %s lists %d file(s)\n", source_name, resource_count - before);
+}
+
+void add_entity_resource(const char* key, const char* value, const char* source_name) {
+    if (str_ieq(key, "skyname")) {
+        static const char* suffixes[] = { "up", "dn", "lf", "rt", "ft", "bk" };
+        char sky[MAX_PATH_LEN];
+        for (int i = 0; i < 6; i++) {
+            if (snprintf(sky, sizeof(sky), "gfx/env/%s%s.tga", value, suffixes[i]) < sizeof(sky)) add_resource(sky, source_name);
+            if (snprintf(sky, sizeof(sky), "gfx/env/%s%s.bmp", value, suffixes[i]) < sizeof(sky)) add_resource(sky, source_name);
+        }
+        return;
+    }
+
+    if (str_ieq(key, "wad")) {
+        char copy[1024];
+        strncpy(copy, value, sizeof(copy) - 1);
+        copy[sizeof(copy) - 1] = '\0';
+        char* tok = strtok(copy, ";");
+        while (tok) {
+            const char* base = get_filename(tok);
+            if (*base) add_resource(base, source_name);
+            tok = strtok(NULL, ";");
+        }
+        return;
+    }
+
+    char val[1024];
+    strncpy(val, value, sizeof(val) - 1);
+    val[sizeof(val) - 1] = '\0';
+    for (char* p = val; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+
+    char ext_lower[16];
+    strncpy(ext_lower, get_extension(val), sizeof(ext_lower) - 1);
+    ext_lower[sizeof(ext_lower) - 1] = '\0';
+    to_lowercase(ext_lower);
+
+    char path[MAX_PATH_LEN];
+    if (strcmp(ext_lower, "wav") == 0) {
+        const char* s = val;
+        if (*s == '!' || *s == '+') return;
+        while (*s == '*' || *s == '/') s++;
+        if (str_ieq_n(s, "sound/", 6)) {
+            add_resource(s, source_name);
+        } else if (snprintf(path, sizeof(path), "sound/%s", s) < sizeof(path)) {
+            add_resource(path, source_name);
+        }
+    } else if (strcmp(ext_lower, "mdl") == 0) {
+        if (strchr(val, '/')) {
+            add_resource(val, source_name);
+        } else if (snprintf(path, sizeof(path), "models/%s", val) < sizeof(path)) {
+            add_resource(path, source_name);
+        }
+    } else if (strcmp(ext_lower, "spr") == 0) {
+        if (strchr(val, '/')) {
+            add_resource(val, source_name);
+        } else if (snprintf(path, sizeof(path), "sprites/%s", val) < sizeof(path)) {
+            add_resource(path, source_name);
+        }
+    } else if (strcmp(ext_lower, "tga") == 0 || strcmp(ext_lower, "bmp") == 0) {
+        if (strchr(val, '/')) add_resource(val, source_name);
+    }
+}
+
+void parse_entity_text(const char* text, const char* source_name) {
+    char key[256];
+    char value[1024];
+    int have_key = 0;
+
+    const char* p = text;
+    while (*p) {
+        if (*p == '{' || *p == '}') {
+            have_key = 0;
+            p++;
+            continue;
+        }
+        if (*p != '"') {
+            p++;
+            continue;
+        }
+        p++;
+        const char* start = p;
+        while (*p && *p != '"') p++;
+        size_t len = p - start;
+        if (*p == '"') p++;
+
+        if (!have_key) {
+            if (len >= sizeof(key)) len = sizeof(key) - 1;
+            memcpy(key, start, len);
+            key[len] = '\0';
+            have_key = 1;
+        } else {
+            if (len >= sizeof(value)) len = sizeof(value) - 1;
+            memcpy(value, start, len);
+            value[len] = '\0';
+            have_key = 0;
+            if (value[0] != '\0') add_entity_resource(key, value, source_name);
+        }
+    }
+}
+
+void scan_bsp_file(const char* abs_path, const char* source_name) {
+    FILE* f = fopen(abs_path, "rb");
+    if (!f) return;
+
+    int header[31];
+    if (fread(header, sizeof(int), 31, f) != 31) {
+        fclose(f);
+        return;
+    }
+    if (header[0] != 30) {
+        log_printf("bsp scan: unsupported BSP version %d: %s\n", header[0], source_name);
+        fclose(f);
+        return;
+    }
+
+    long ent_offset = header[1];
+    long ent_length = header[2];
+
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+
+    if (ent_offset < 0 || ent_length <= 0 || ent_length > 8 * 1024 * 1024 ||
+        ent_offset > file_size || ent_length > file_size - ent_offset) {
+        log_printf("bsp scan: bad entity lump in %s\n", source_name);
+        fclose(f);
+        return;
+    }
+
+    char* ents = malloc(ent_length + 1);
+    if (!ents) {
+        fclose(f);
+        return;
+    }
+    fseek(f, ent_offset, SEEK_SET);
+    if (fread(ents, 1, ent_length, f) != (size_t)ent_length) {
+        free(ents);
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    ents[ent_length] = '\0';
+
+    int before = resource_count;
+    parse_entity_text(ents, source_name);
+    free(ents);
+    log_printf("bsp scan: %s references %d file(s)\n", source_name, resource_count - before);
+}
+
+int sky_sibling_satisfied(int idx, const char* baseDir) {
+    const char* path = resources[idx].path;
+    if (!str_ieq_n(path, "gfx/env/", 8)) return 0;
+
+    const char* ext = get_extension(path);
+    const char* other;
+    if (str_ieq(ext, "tga")) other = "bmp";
+    else if (str_ieq(ext, "bmp")) other = "tga";
+    else return 0;
+
+    char sibling[MAX_PATH_LEN];
+    strncpy(sibling, path, sizeof(sibling) - 1);
+    sibling[sizeof(sibling) - 1] = '\0';
+    char* dot = strrchr(sibling, '.');
+    if (!dot) return 0;
+    strcpy(dot + 1, other);
+
+    for (int i = 0; i < resource_count; i++) {
+        if (i != idx && resources[i].found && str_ieq(resources[i].path, sibling)) return 1;
+    }
+
+    char full[MAX_PATH_LEN];
+    struct stat st;
+    if (snprintf(full, sizeof(full), "%s/%s", baseDir, sibling) < sizeof(full) &&
+        stat(full, &st) == 0) return 1;
+    return 0;
+}
+
+void report_missing_resources(const char* baseDir) {
+    int missing = 0;
+    for (int i = 0; i < resource_count; i++) {
+        if (resources[i].found) continue;
+
+        char full[MAX_PATH_LEN];
+        if (snprintf(full, sizeof(full), "%s/%s", baseDir, resources[i].path) >= sizeof(full)) continue;
+        struct stat st;
+        if (stat(full, &st) == 0) continue;
+
+        if (str_ieq_n(resources[i].path, "gfx/env/", 8) && str_ieq(get_extension(resources[i].path), "bmp")) continue;
+        if (sky_sibling_satisfied(i, baseDir)) continue;
+
+        if (missing == 0) log_printf("referenced but not in archive (may be stock content):\n");
+        log_printf("  %s (from %s)\n", resources[i].path, resources[i].source);
+        missing++;
+    }
 }
 
 void add_pending_txt(const char* temp_path, const char* original_pathname) {
@@ -526,7 +810,7 @@ const char* detect_archive_type(const char* filename) {
 void process_pending_txt_files(const char* baseDir, int* junked, int delete_junk) {
     log_printf("processing txt files...\n");
     
-    if (bsp_count == 0) {
+    if (bsp_count == 0 && resource_count == 0) {
         log_printf("no BSP files found, junking all TXT files...\n");
         for (int i = 0; i < pending_txt_count; i++) {
             const char* temp_path = pending_txt_files[i].temp_path;
@@ -573,8 +857,9 @@ void process_pending_txt_files(const char* baseDir, int* junked, int delete_junk
         const char* original_pathname = pending_txt_files[i].original_pathname;
         
         char actualPath[MAX_PATH_LEN];
-        
-        if (txt_has_matching_bsp(original_pathname) || is_overview_description_file(temp_path)) {
+        int res_idx = find_resource_index(get_filename(original_pathname));
+
+        if (txt_has_matching_bsp(original_pathname) || is_overview_description_file(temp_path) || res_idx >= 0) {
             if (is_overview_description_file(temp_path)) {
                 const char* filename = get_filename(original_pathname);
                 int result = snprintf(actualPath, sizeof(actualPath), "%s/overviews/%s", baseDir, filename);
@@ -590,21 +875,32 @@ void process_pending_txt_files(const char* baseDir, int* junked, int delete_junk
                 if (dir_result < sizeof(overviewsDir)) {
                     create_dir(overviewsDir);
                 }
-            } else {
+            } else if (txt_has_matching_bsp(original_pathname)) {
                 const char* filename = get_filename(original_pathname);
                 int result = snprintf(actualPath, sizeof(actualPath), "%s/maps/%s", baseDir, filename);
-                
+
                 if (result >= sizeof(actualPath)) {
                     log_printf("ERROR: Maps path too long, skipping: %s\n", filename);
                     remove(temp_path);
                     continue;
                 }
-                
+
                 char mapsDir[MAX_PATH_LEN];
                 int dir_result = snprintf(mapsDir, sizeof(mapsDir), "%s/maps", baseDir);
                 if (dir_result < sizeof(mapsDir)) {
                     create_dir(mapsDir);
                 }
+            } else {
+                const char* filename = get_filename(original_pathname);
+                int result = snprintf(actualPath, sizeof(actualPath), "%s/%s", baseDir, resources[res_idx].path);
+
+                if (result >= sizeof(actualPath)) {
+                    log_printf("ERROR: Resource path too long, skipping: %s\n", filename);
+                    remove(temp_path);
+                    continue;
+                }
+
+                create_dirs_recursive(actualPath);
             }
             
             if (rename(temp_path, actualPath) == 0) {
@@ -773,6 +1069,8 @@ void process_staged_file(const char* src_path, const char* rel_path, const char*
 
     log_printf("%s\n", safe_pathname);
 
+    int res_idx = mark_resource_found(get_filename(safe_pathname));
+
     char target_dir[256];
     get_target_directory(get_filename(safe_pathname), safe_pathname, target_dir, sizeof(target_dir), skip_addons);
 
@@ -837,6 +1135,12 @@ void process_staged_file(const char* src_path, const char* rel_path, const char*
         int result;
         if (sub) {
             result = snprintf(finalPath, sizeof(finalPath), "%s/%s", baseDir, sub);
+        } else if (res_idx >= 0) {
+            result = snprintf(finalPath, sizeof(finalPath), "%s/%s", baseDir, resources[res_idx].path);
+            if (strcmp(target_dir, "junk") == 0) {
+                log_printf("keeping res-listed file: %s\n", safe_pathname);
+                strcpy(target_dir, "RESLIST");
+            }
         } else {
             result = snprintf(finalPath, sizeof(finalPath), "%s/%s/%s", baseDir, target_dir, get_filename(safe_pathname));
         }
@@ -890,6 +1194,34 @@ void process_staged_file(const char* src_path, const char* rel_path, const char*
 }
 
 #ifdef _WIN32
+void scan_staged_tree(const char* abs_dir) {
+    char searchPath[MAX_PATH_LEN];
+    if (snprintf(searchPath, sizeof(searchPath), "%s\\*", abs_dir) >= sizeof(searchPath)) return;
+
+    WIN32_FIND_DATA findFileData;
+    HANDLE hFind = FindFirstFile(searchPath, &findFileData);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (strcmp(findFileData.cFileName, ".") == 0 || strcmp(findFileData.cFileName, "..") == 0) {
+            continue;
+        }
+        char absPath[MAX_PATH_LEN];
+        if (snprintf(absPath, sizeof(absPath), "%s\\%s", abs_dir, findFileData.cFileName) >= sizeof(absPath)) {
+            continue;
+        }
+        if (findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            scan_staged_tree(absPath);
+        } else {
+            const char* ext = get_extension(findFileData.cFileName);
+            if (str_ieq(ext, "res")) scan_res_file(absPath, findFileData.cFileName);
+            else if (str_ieq(ext, "bsp")) scan_bsp_file(absPath, findFileData.cFileName);
+        }
+    } while (FindNextFile(hFind, &findFileData) != 0);
+
+    FindClose(hFind);
+}
+
 void walk_extracted_dir(const char* abs_dir, const char* rel_prefix, const char* baseDir,
                         int skip_addons, int delete_junk,
                         int* count, int* extracted, int* junked, int* skipped) {
@@ -956,6 +1288,33 @@ void remove_tree(const char* abs_dir) {
     RemoveDirectory(abs_dir);
 }
 #else
+void scan_staged_tree(const char* abs_dir) {
+    DIR* dir = opendir(abs_dir);
+    if (!dir) return;
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        char absPath[MAX_PATH_LEN];
+        if (snprintf(absPath, sizeof(absPath), "%s/%s", abs_dir, entry->d_name) >= sizeof(absPath)) {
+            continue;
+        }
+        struct stat st;
+        if (stat(absPath, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            scan_staged_tree(absPath);
+        } else if (S_ISREG(st.st_mode)) {
+            const char* ext = get_extension(entry->d_name);
+            if (str_ieq(ext, "res")) scan_res_file(absPath, entry->d_name);
+            else if (str_ieq(ext, "bsp")) scan_bsp_file(absPath, entry->d_name);
+        }
+    }
+    closedir(dir);
+}
+
 void walk_extracted_dir(const char* abs_dir, const char* rel_prefix, const char* baseDir,
                         int skip_addons, int delete_junk,
                         int* count, int* extracted, int* junked, int* skipped) {
@@ -1046,6 +1405,7 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
 
     bsp_count = 0;
     pending_txt_count = 0;
+    resource_count = 0;
 
     int count = 0;
     int extracted = 0;
@@ -1065,6 +1425,8 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
         log_printf("WARNING: 7z reported errors (exit code %d) for %s, processing extracted files anyway\n", rc, archive_path);
     }
 
+    scan_staged_tree(staging);
+
     walk_extracted_dir(staging, "", baseDir, skip_addons, delete_junk, &count, &extracted, &junked, &skipped);
     remove_tree(staging);
     if (is_directory(staging)) {
@@ -1072,6 +1434,7 @@ int extract_archive(const char* archive_path, const char* baseDir, int skip_addo
     }
 
     process_pending_txt_files(baseDir, &junked, delete_junk);
+    report_missing_resources(baseDir);
 
     log_printf("archive complete: %d files processed, %d files extracted, %d files junked", count, extracted, junked);
     if (skipped > 0) {
@@ -1300,9 +1663,8 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    snprintf(full_base_dir, sizeof(full_base_dir), "%s%ccstrike", first_archive_dir, PATH_SEP);
-
-    if (!validate_path_length(full_base_dir, "base extraction directory")) {
+    int base_len = snprintf(full_base_dir, sizeof(full_base_dir), "%s%ccstrike", first_archive_dir, PATH_SEP);
+    if (base_len >= sizeof(full_base_dir)) {
         log_printf("ERROR: Base directory path too long\n");
         return -1;
     }

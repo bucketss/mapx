@@ -14,4 +14,4 @@ flags:
 
 by default it moves junk files to a junk folder, and also preserves any `addons\` folder content in `__addons\` to prevent overwrites (but still allow a map to come with an accompanying plugin or w/e)
 
-this doesn't just extract, it will also put loose files in the correct locations
+this doesn't just extract, it will also check the bsp and put loose files in the correct locations
